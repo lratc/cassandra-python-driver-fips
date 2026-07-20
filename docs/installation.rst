@@ -26,7 +26,7 @@ To check if the installation was successful, you can run::
 
     python -c 'import cassandra; print(cassandra.__version__)'
 
-This command should print something like ``3.30.0``.
+This command should print something like ``3.30.1``.
 
 .. _installation-datastax-graph:
 
@@ -196,9 +196,6 @@ asyncore from the runtime but this event loop can still be used in newer version
 The ``asyncio`` event loop is generally functional but still somewhat experimental and not recommended
 for production systems.  We anticipate significant improvements to this event loop (including hopefully
 making this event loop the default going forward) in 3.31.0.
-
-The ``gevent``, ``eventlet`` and ``Twisted`` event loops have been deprecated in 3.30.0 and will be removed
-completely in 3.31.0.
 
 libev support
 ^^^^^^^^^^^^^

@@ -1873,7 +1873,7 @@ class MD5Token(HashToken):
             raise NoMD5()
         if isinstance(key, str):
             key = key.encode('UTF-8')
-        return abs(varint_unpack(md5(key).digest()))
+        return abs(varint_unpack(md5(key,usedforsecurity=False).digest()))
 
 
 class BytesToken(Token):

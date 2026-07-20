@@ -31,10 +31,8 @@ import json
 import logging
 from warnings import warn
 from random import random
-import re
 import queue
 import socket
-import sys
 import time
 from threading import Lock, RLock, Thread, Event
 import uuid
@@ -83,9 +81,6 @@ from cassandra.marshal import int64_pack
 from cassandra.timestamps import MonotonicTimestampGenerator
 from cassandra.util import _resolve_contact_points_to_string_map, Version
 
-from cassandra.datastax.insights.reporter import MonitorReporter
-from cassandra.datastax.insights.util import version_supports_insights
-
 from cassandra.datastax.graph import (graph_object_row_factory, GraphOptions, GraphSON1Serializer,
                                       GraphProtocol, GraphSON2Serializer, GraphStatement, SimpleGraphStatement,
                                       graph_graphson2_row_factory, graph_graphson3_row_factory,
@@ -94,53 +89,9 @@ from cassandra.datastax.graph.query import _request_timeout_key, _GraphSONContex
 from cassandra.datastax import cloud as dscloud
 
 try:
-    from cassandra.io.twistedreactor import TwistedConnection
-except ImportError:
-    TwistedConnection = None
-
-try:
-    from cassandra.io.eventletreactor import EventletConnection
-# PYTHON-1364
-#
-# At the moment eventlet initialization is chucking AttributeErrors due to its dependence on pyOpenSSL
-# and some changes in Python 3.12 which have some knock-on effects there.
-except (ImportError, AttributeError):
-    EventletConnection = None
-
-try:
     from weakref import WeakSet
 except ImportError:
     from cassandra.util import WeakSet  # NOQA
-
-def _is_gevent_monkey_patched():
-    if 'gevent.monkey' not in sys.modules:
-        return False
-    import gevent.socket
-    return socket.socket is gevent.socket.socket
-
-def _try_gevent_import():
-    if _is_gevent_monkey_patched():
-        from cassandra.io.geventreactor import GeventConnection
-        return (GeventConnection,None)
-    else:
-        return (None,None)
-
-def _is_eventlet_monkey_patched():
-    if 'eventlet.patcher' not in sys.modules:
-        return False
-    try:
-        import eventlet.patcher
-        return eventlet.patcher.is_monkey_patched('socket')
-    # Another case related to PYTHON-1364
-    except AttributeError:
-        return False
-
-def _try_eventlet_import():
-    if _is_eventlet_monkey_patched():
-        from cassandra.io.eventletreactor import EventletConnection
-        return (EventletConnection,None)
-    else:
-        return (None,None)
 
 def _try_libev_import():
     try:
@@ -168,7 +119,7 @@ def _connection_reduce_fn(val,import_fn):
 
 log = logging.getLogger(__name__)
 
-conn_fns = (_try_gevent_import, _try_eventlet_import, _try_libev_import, _try_asyncore_import)
+conn_fns = (_try_libev_import, _try_asyncore_import)
 (conn_class, excs) = reduce(_connection_reduce_fn, conn_fns, (None,[]))
 if not conn_class:
     raise DependencyException("Unable to load a default connection class", excs)
@@ -878,18 +829,12 @@ class Cluster(object):
 
     * :class:`cassandra.io.asyncorereactor.AsyncoreConnection`
     * :class:`cassandra.io.libevreactor.LibevConnection`
-    * :class:`cassandra.io.eventletreactor.EventletConnection` (requires monkey-patching - see doc for details)
-    * :class:`cassandra.io.geventreactor.GeventConnection` (requires monkey-patching - see doc for details)
-    * :class:`cassandra.io.twistedreactor.TwistedConnection`
     * EXPERIMENTAL: :class:`cassandra.io.asyncioreactor.AsyncioConnection`
 
     By default, ``AsyncoreConnection`` will be used, which uses
     the ``asyncore`` module in the Python standard library.
 
     If ``libev`` is installed, ``LibevConnection`` will be used instead.
-
-    If ``gevent`` or ``eventlet`` monkey-patching is detected, the corresponding
-    connection class will be used automatically.
 
     ``AsyncioConnection``, which uses the ``asyncio`` module in the Python
     standard library, is also available, but currently experimental. Note that
@@ -998,34 +943,6 @@ class Cluster(object):
 
     Applications can set this value for custom timestamp behavior. See the
     documentation for :meth:`Session.timestamp_generator`.
-    """
-
-    monitor_reporting_enabled = True
-    """
-    A boolean indicating if monitor reporting, which sends gathered data to
-    Insights when running against DSE 6.8 and higher.
-    """
-
-    monitor_reporting_interval = 30
-    """
-    A boolean indicating if monitor reporting, which sends gathered data to
-    Insights when running against DSE 6.8 and higher.
-    """
-
-    client_id = None
-    """
-    A UUID that uniquely identifies this Cluster object to Insights. This will
-    be generated automatically unless the user provides one.
-    """
-
-    application_name = ''
-    """
-    A string identifying this application to Insights.
-    """
-
-    application_version = ''
-    """
-    A string identifying this application's version to Insights
     """
 
     cloud = None
@@ -1146,11 +1063,6 @@ class Cluster(object):
                  no_compact=False,
                  ssl_context=None,
                  endpoint_factory=None,
-                 application_name=None,
-                 application_version=None,
-                 monitor_reporting_enabled=True,
-                 monitor_reporting_interval=30,
-                 client_id=None,
                  cloud=None,
                  column_encryption_policy=None):
         """
@@ -1168,9 +1080,7 @@ class Cluster(object):
                 raise ValueError("contact_points, endpoint_factory, ssl_context, and ssl_options "
                                  "cannot be specified with a cloud configuration")
 
-            uses_twisted = TwistedConnection and issubclass(self.connection_class, TwistedConnection)
-            uses_eventlet = EventletConnection and issubclass(self.connection_class, EventletConnection)
-            cloud_config = dscloud.get_cloud_config(cloud, create_pyopenssl_context=uses_twisted or uses_eventlet)
+            cloud_config = dscloud.get_cloud_config(cloud)
 
             ssl_context = cloud_config.ssl_context
             ssl_options = {'check_hostname': True}
@@ -1211,8 +1121,6 @@ class Cluster(object):
             raw_contact_points.append(cp if isinstance(cp, tuple) else (cp, port))
 
         self.endpoints_resolved = [cp for cp in self.contact_points if isinstance(cp, EndPoint)]
-        self._endpoint_map_for_insights = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port)
-                                           for ep in self.endpoints_resolved}
 
         strs_resolved_map = _resolve_contact_points_to_string_map(raw_contact_points)
         self.endpoints_resolved.extend(list(chain(
@@ -1222,14 +1130,14 @@ class Cluster(object):
             ]
         )))
 
-        self._endpoint_map_for_insights.update(
-            {key: ['{ip}:{port}'.format(ip=ip, port=port) for ip, port in value]
-             for key, value in strs_resolved_map.items() if value is not None}
-        )
-
         if contact_points and (not self.endpoints_resolved):
             # only want to raise here if the user specified CPs but resolution failed
-            raise UnresolvableContactPoints(self._endpoint_map_for_insights)
+            endpoint_map = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port) for ep in self.endpoints_resolved}
+            endpoint_map.update(
+                {key: ['{ip}:{port}'.format(ip=ip, port=port) for ip, port in value]
+                 for key, value in strs_resolved_map.items() if value is not None}
+            )
+            raise UnresolvableContactPoints(endpoint_map)
 
         self.compression = compression
 
@@ -1353,8 +1261,6 @@ class Cluster(object):
         self.connect_timeout = connect_timeout
         self.prepare_on_all_hosts = prepare_on_all_hosts
         self.reprepare_on_up = reprepare_on_up
-        self.monitor_reporting_enabled = monitor_reporting_enabled
-        self.monitor_reporting_interval = monitor_reporting_interval
 
         self._listeners = set()
         self._listener_lock = Lock()
@@ -1389,7 +1295,7 @@ class Cluster(object):
             HostDistance.REMOTE: DEFAULT_MAX_CONNECTIONS_PER_REMOTE_HOST
         }
 
-        self.executor = self._create_thread_pool_executor(max_workers=executor_threads)
+        self.executor = ThreadPoolExecutor(max_workers=executor_threads)
         self.scheduler = _Scheduler(self.executor)
 
         self._lock = RLock()
@@ -1403,49 +1309,6 @@ class Cluster(object):
             self.schema_event_refresh_window, self.topology_event_refresh_window,
             self.status_event_refresh_window,
             schema_metadata_enabled, token_metadata_enabled)
-
-        if client_id is None:
-            self.client_id = uuid.uuid4()
-        if application_name is not None:
-            self.application_name = application_name
-        if application_version is not None:
-            self.application_version = application_version
-
-    def _create_thread_pool_executor(self, **kwargs):
-        """
-        Create a ThreadPoolExecutor for the cluster. In most cases, the built-in
-        `concurrent.futures.ThreadPoolExecutor` is used.
-
-        Python 3.7+ and Eventlet cause the `concurrent.futures.ThreadPoolExecutor`
-        to hang indefinitely. In that case, the user needs to have the `futurist`
-        package so we can use the `futurist.GreenThreadPoolExecutor` class instead.
-
-        :param kwargs: All keyword args are passed to the ThreadPoolExecutor constructor.
-        :return: A ThreadPoolExecutor instance.
-        """
-        tpe_class = ThreadPoolExecutor
-        if sys.version_info[0] >= 3 and sys.version_info[1] >= 7:
-            try:
-                from cassandra.io.eventletreactor import EventletConnection
-                is_eventlet = issubclass(self.connection_class, EventletConnection)
-            except:
-                # Eventlet is not available or can't be detected
-                return tpe_class(**kwargs)
-
-            if is_eventlet:
-                try:
-                    from futurist import GreenThreadPoolExecutor
-                    tpe_class = GreenThreadPoolExecutor
-                except ImportError:
-                    # futurist is not available
-                    raise ImportError(
-                        ("Python 3.7+ and Eventlet cause the `concurrent.futures.ThreadPoolExecutor` "
-                         "to hang indefinitely. If you want to use the Eventlet reactor, you "
-                         "need to install the `futurist` package to allow the driver to use "
-                         "the GreenThreadPoolExecutor. See https://github.com/eventlet/eventlet/issues/508 "
-                         "for more details."))
-
-        return tpe_class(**kwargs)
 
     def register_user_type(self, keyspace, user_type, klass):
         """
@@ -2561,8 +2424,7 @@ class Session(object):
 
     session_id = None
     """
-    A UUID that uniquely identifies this Session to Insights. This will be
-    generated automatically.
+    A UUID that uniquely identifies this Session. This will be generated automatically.
     """
 
     _lock = None
@@ -2615,22 +2477,7 @@ class Session(object):
             except AttributeError:
                 log.info("Unable to set column encryption policy for session")
 
-        if self.cluster.monitor_reporting_enabled:
-            cc_host = self.cluster.get_control_connection_host()
-            valid_insights_version = (cc_host and version_supports_insights(cc_host.dse_version))
-            if valid_insights_version:
-                self._monitor_reporter = MonitorReporter(
-                    interval_sec=self.cluster.monitor_reporting_interval,
-                    session=self,
-                )
-            else:
-                if cc_host:
-                    log.debug('Not starting MonitorReporter thread for Insights; '
-                              'not supported by server version {v} on '
-                              'ControlConnection host {c}'.format(v=cc_host.release_version, c=cc_host))
-
-        log.debug('Started Session with client_id {} and session_id {}'.format(self.cluster.client_id,
-                                                                               self.session_id))
+        log.debug('Started Session with session_id {}'.format(self.session_id))
 
     def execute(self, query, parameters=None, timeout=_NOT_SET, trace=False,
                 custom_payload=None, execution_profile=EXEC_PROFILE_DEFAULT,
